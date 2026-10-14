@@ -1,0 +1,47 @@
+---
+# Single source of truth for the backup configuration.
+#
+# The policies in policies/managed/ read these values at template-resolution
+# time on the hub, using {{hub fromConfigMap ... hub}}. Edit this ConfigMap and
+# the change propagates to every targeted managed cluster - you do not need to
+# edit the Policy manifests themselves.
+#
+# Apply to the HUB cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etcd-backup-config
+  namespace: open-cluster-management-backup
+data:
+  # ---- Bucket holding the etcd snapshot (snapshot_<ts>.db) --------------------
+  s3_bucket: "CHANGEME-etcd-snapshots"
+  s3_prefix: "etcd-snapshots"
+
+  # ---- SEPARATE bucket holding key material -----------------------------------
+  # static_kuberesources_<ts>.tar.gz contains the etcd *encryption keys* when
+  # etcd encryption is enabled, so Red Hat recommends storing it apart from the
+  # snapshot. Point this at a different bucket with a tighter bucket policy and
+  # its own KMS key. Using the same bucket with a different prefix still works
+  # but gives you a weaker separation of duties.
+  s3_keys_bucket: "CHANGEME-etcd-keys"
+  s3_keys_prefix: "etcd-keys"
+
+  s3_region: "us-east-1"
+
+  # ---- Encryption at rest -----------------------------------------------------
+  # KMS key ARN/ID for SSE-KMS. Leave empty to fall back to SSE-S3 (AES256).
+  kms_key_id: ""
+  kms_key_id_keys: ""
+
+  # ---- Schedule ---------------------------------------------------------------
+  # Default: every 6 hours, at a minute offset so that all clusters do not fire
+  # at once. Retention is handled by the S3 lifecycle rule (aws/s3-lifecycle.json),
+  # not by the job.
+  schedule: "17 */6 * * *"
+
+  # ---- Images -----------------------------------------------------------------
+  # ose_cli_image needs `oc` and is used for the privileged snapshot step.
+  # aws_cli_image needs the AWS CLI v2 and is used for the upload step.
+  # Mirror both into your own registry for disconnected clusters.
+  ose_cli_image: "registry.redhat.io/openshift4/ose-cli:latest"
+  aws_cli_image: "public.ecr.aws/aws-cli/aws-cli:latest"

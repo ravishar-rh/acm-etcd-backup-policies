@@ -1,0 +1,151 @@
+---
+# Namespace, service account, RBAC and S3 credential for the etcd backup job.
+# Split from the CronJob policy so the CronJob can declare a dependency and
+# never land on a cluster that is missing its credential.
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: policy-etcd-backup-prereqs
+  namespace: etcd-backup-policies
+  annotations:
+    policy.open-cluster-management.io/categories: CP-9 Information System Backup
+    policy.open-cluster-management.io/controls: CP-9
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/description: >-
+      Prerequisites for the managed cluster etcd backup: the ocp-etcd-backup
+      namespace, a service account allowed to run privileged on control plane
+      nodes, read access to the etcd encryption key secrets, and the S3
+      credential sourced from the hub.
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: etcd-backup-prereqs
+        spec:
+          remediationAction: enforce
+          severity: high
+          # Clean up if a cluster is de-labelled / the policy is removed.
+          pruneObjectBehavior: DeleteIfCreated
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: ocp-etcd-backup
+                  labels:
+                    # The backup pod is privileged and uses the host PID
+                    # namespace; opt the namespace out of PSA enforcement.
+                    pod-security.kubernetes.io/enforce: privileged
+                    pod-security.kubernetes.io/audit: privileged
+                    pod-security.kubernetes.io/warn: privileged
+                    security.openshift.io/scc.podSecurityLabelSync: "false"
+
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: etcd-backup
+                  namespace: ocp-etcd-backup
+
+            # Allows the pod to run with the `privileged` SCC. Scoped to the
+            # backup namespace rather than granted cluster-wide.
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: RoleBinding
+                metadata:
+                  name: etcd-backup-scc-privileged
+                  namespace: ocp-etcd-backup
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: system:openshift:scc:privileged
+                subjects:
+                  - kind: ServiceAccount
+                    name: etcd-backup
+                    namespace: ocp-etcd-backup
+
+            # Read the APIServer config so the backup records whether (and with
+            # which provider) etcd encryption was enabled at snapshot time.
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: etcd-backup-reader
+                rules:
+                  - apiGroups: ["config.openshift.io"]
+                    resources: ["apiservers"]
+                    verbs: ["get", "list"]
+                  - apiGroups: ["operator.openshift.io"]
+                    resources: ["etcds", "kubeapiservers", "openshiftapiservers"]
+                    verbs: ["get", "list"]
+
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: etcd-backup-reader
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: etcd-backup-reader
+                subjects:
+                  - kind: ServiceAccount
+                    name: etcd-backup
+                    namespace: ocp-etcd-backup
+
+            # THE ETCD ENCRYPTION KEYS.
+            # When etcd encryption is on, the AES/AES-GCM keys live as secrets
+            # named encryption-key-<component>-<N> in openshift-config-managed.
+            # Namespace-scoped read access, nothing wider.
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: Role
+                metadata:
+                  name: etcd-backup-encryption-keys
+                  namespace: openshift-config-managed
+                rules:
+                  - apiGroups: [""]
+                    resources: ["secrets"]
+                    verbs: ["get", "list"]
+
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: RoleBinding
+                metadata:
+                  name: etcd-backup-encryption-keys
+                  namespace: openshift-config-managed
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: Role
+                  name: etcd-backup-encryption-keys
+                subjects:
+                  - kind: ServiceAccount
+                    name: etcd-backup
+                    namespace: ocp-etcd-backup
+
+            # S3 credential, resolved on the HUB from the single secret in
+            # open-cluster-management-backup. `fromSecret` returns the already
+            # base64-encoded value, so it belongs under `data`, not `stringData`.
+            # ACM encrypts these values per-cluster before replication.
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: Secret
+                metadata:
+                  name: etcd-backup-s3
+                  namespace: ocp-etcd-backup
+                type: Opaque
+                data:
+                  aws_access_key_id: '{{hub fromSecret "open-cluster-management-backup" "etcd-backup-s3" "aws_access_key_id" hub}}'
+                  aws_secret_access_key: '{{hub fromSecret "open-cluster-management-backup" "etcd-backup-s3" "aws_secret_access_key" hub}}'

@@ -1,0 +1,100 @@
+---
+# OPTIONAL - VALIDATE BEFORE RELYING ON IT.
+#
+# A backup that silently stopped running is the single most common way a backup
+# strategy fails, and neither of the main policies detects it: an enforced
+# CronJob stays Compliant forever as long as the *object* exists, even if every
+# run has failed for a month.
+#
+# This policy closes that gap by reading status.lastSuccessfulTime off the
+# CronJob and going NonCompliant when it is older than MAX_AGE_SECONDS. It does
+# that by conditionally asking for a ConfigMap that is never created - when the
+# backup is stale the object is missing and the policy reports NonCompliant
+# with that object's name in the message.
+#
+# It leans on sprig template functions (`toDate`, `unixEpoch`, `now`) inside
+# object-templates-raw. Those are available in recent ACM releases, but the
+# exact set varies by version and this one has not been run against your hub.
+# Apply it on its own first and confirm it reports Compliant on a healthy
+# cluster before you wire it into alerting:
+#
+#   oc get policy policy-etcd-backup-freshness -n etcd-backup-policies -o yaml
+#
+# If template resolution errors, the policy will say so in its status.
+# The vendor-neutral alternative that needs no templating at all is an S3-side
+# check - see "Detecting a stale backup" in the README.
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: policy-etcd-backup-freshness
+  namespace: etcd-backup-policies
+  annotations:
+    policy.open-cluster-management.io/categories: CP-9 Information System Backup
+    policy.open-cluster-management.io/controls: CP-9
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/description: >-
+      Reports NonCompliant when the etcd backup CronJob has not completed
+      successfully within the last 12 hours.
+spec:
+  remediationAction: inform
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: etcd-backup-freshness
+        spec:
+          remediationAction: inform
+          severity: high
+          # Re-evaluate every 10 minutes at most; no need to hammer the API.
+          evaluationInterval:
+            compliant: 10m
+            noncompliant: 10m
+          object-templates-raw: |
+            {{- /* 12 hours, for a 6-hourly schedule: one missed run is tolerated. */ -}}
+            {{- $maxAge := 43200 -}}
+            {{- $cj := (lookup "batch/v1" "CronJob" "ocp-etcd-backup" "etcd-backup") -}}
+            {{- $last := "" -}}
+            {{- if $cj -}}
+              {{- if $cj.status -}}
+                {{- $last = (default "" $cj.status.lastSuccessfulTime) -}}
+              {{- end -}}
+            {{- end -}}
+            {{- $stale := true -}}
+            {{- if ne $last "" -}}
+              {{- $age := sub (now | unixEpoch) (toDate "2006-01-02T15:04:05Z" $last | unixEpoch) -}}
+              {{- if lt $age $maxAge -}}
+                {{- $stale = false -}}
+              {{- end -}}
+            {{- end -}}
+            {{- if $stale }}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: etcd-backup-succeeded-within-12h
+                  namespace: ocp-etcd-backup
+                data:
+                  lastSuccessfulTime: {{ printf "%q" (default "never" $last) }}
+            {{- else }}
+            []
+            {{- end }}
+---
+# Reuses the Placement from policies/managed/placement-managed.yaml, so apply
+# that directory first. Bound separately rather than added to the PolicySet so
+# this can be removed on its own if the templating does not behave.
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-etcd-backup-freshness
+  namespace: etcd-backup-policies
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: placement-etcd-backup
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: Policy
+    name: policy-etcd-backup-freshness

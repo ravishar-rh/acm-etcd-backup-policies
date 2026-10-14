@@ -1,0 +1,5 @@
+# Never commit the real credential - only the .example.yaml belongs in git.
+hub-config/03-etcd-backup-s3-secret.yaml
+*-secret.yaml
+!*.example.yaml
+.env

@@ -1,0 +1,55 @@
+---
+# Groups the four hub-chain policies plus the health check.
+apiVersion: policy.open-cluster-management.io/v1beta1
+kind: PolicySet
+metadata:
+  name: acm-hub-backup
+  namespace: etcd-backup-policies
+spec:
+  description: >-
+    Backs up ACM hub state to S3 via OADP/Velero. Used in place of an etcd
+    snapshot, which is not obtainable on a ROSA HCP hub.
+  policies:
+    - policy-hub-backup-enable-component
+    - policy-hub-backup-oadp
+    - policy-hub-backup-dpa
+    - policy-hub-backup-schedule
+    - policy-hub-backup-healthy
+---
+# Targets the hub itself. ACM represents the self-managed hub as the
+# ManagedCluster named "local-cluster", carrying the label local-cluster=true.
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: placement-hub
+  namespace: etcd-backup-policies
+spec:
+  clusterSets:
+    - global
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: local-cluster
+              operator: In
+              values:
+                - "true"
+  tolerations:
+    - key: cluster.open-cluster-management.io/unreachable
+      operator: Exists
+    - key: cluster.open-cluster-management.io/unavailable
+      operator: Exists
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-acm-hub-backup
+  namespace: etcd-backup-policies
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: placement-hub
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: PolicySet
+    name: acm-hub-backup

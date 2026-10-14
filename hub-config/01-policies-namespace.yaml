@@ -1,0 +1,17 @@
+---
+# Namespace that holds the Policy / Placement / PlacementBinding objects.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: etcd-backup-policies
+---
+# Binds the default "global" ManagedClusterSet into the policy namespace so that
+# Placements in this namespace can select any managed cluster, including the
+# hub's own "local-cluster".
+apiVersion: cluster.open-cluster-management.io/v1beta2
+kind: ManagedClusterSetBinding
+metadata:
+  name: global
+  namespace: etcd-backup-policies
+spec:
+  clusterSet: global

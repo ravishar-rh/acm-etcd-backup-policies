@@ -1,0 +1,78 @@
+---
+apiVersion: policy.open-cluster-management.io/v1beta1
+kind: PolicySet
+metadata:
+  name: managed-cluster-etcd-backup
+  namespace: etcd-backup-policies
+spec:
+  description: >-
+    etcd snapshot + encryption key backup to S3 for standalone OpenShift
+    managed clusters.
+  policies:
+    - policy-etcd-backup-prereqs
+    - policy-etcd-backup-cronjob
+---
+# Three filters, all of which must pass:
+#
+#  1. local-cluster != true
+#       The hub is ROSA HCP. It has no control plane nodes to snapshot, so
+#       this policy must never land on it. The hub is covered by the OADP
+#       chain in policies/hub/ instead.
+#
+#  2. product.open-cluster-management.io == OpenShift
+#       This ClusterClaim distinguishes self-managed OpenShift from the managed
+#       offerings (ROSA, ARO, OSD, ROKS). On every managed offering the control
+#       plane sits in the vendor's account: no master nodes, no
+#       /usr/local/bin/cluster-backup.sh, nothing to snapshot. Selecting on the
+#       claim means a newly imported ROSA cluster cannot accidentally pick this
+#       policy up.
+#
+#       Verify what your clusters actually report before relying on it:
+#         oc get managedcluster -o json | jq -r \
+#           '.items[] | "\(.metadata.name)\t\(.status.clusterClaims[]
+#            | select(.name=="product.open-cluster-management.io") | .value)"'
+#
+#  3. etcd-backup == enabled
+#       Explicit opt-in label, so adding a cluster to the backup set is a
+#       deliberate act:
+#         oc label managedcluster <name> etcd-backup=enabled
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: placement-etcd-backup
+  namespace: etcd-backup-policies
+spec:
+  clusterSets:
+    - global
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: local-cluster
+              operator: NotIn
+              values:
+                - "true"
+            - key: etcd-backup
+              operator: In
+              values:
+                - "enabled"
+        claimSelector:
+          matchExpressions:
+            - key: product.open-cluster-management.io
+              operator: In
+              values:
+                - "OpenShift"
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: binding-managed-cluster-etcd-backup
+  namespace: etcd-backup-policies
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: placement-etcd-backup
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: PolicySet
+    name: managed-cluster-etcd-backup
