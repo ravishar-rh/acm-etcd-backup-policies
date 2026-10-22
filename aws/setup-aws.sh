@@ -1,40 +1,38 @@
 #!/usr/bin/env bash
 #
-# Creates the AWS side of the backup setup:
+# Creates the AWS side of the managed cluster etcd backup:
 #
-#   3 buckets   - hub (ACM/Velero), etcd snapshots, etcd key material
-#   3 KMS keys  - one per bucket, so the key material can be locked down
-#                 independently of the snapshots
-#   1 IAM role  - IRSA role assumed by Velero on the ROSA HCP hub
-#   1 IAM user  - write-only uploader for the managed cluster CronJobs
-#                 (skip with --no-iam-user and use IRSA instead where the
-#                  managed clusters are themselves on AWS - see README)
+#   2 buckets   - etcd snapshots, and (separately) etcd key material
+#   2 KMS keys  - one per bucket, so key material is locked down independently
+#   1 IAM user  - write-only uploader for the etcd-backup-upload CronJob
+#
+# With --create-credential it also mints an access key for that user and parks
+# it in AWS Secrets Manager, which is where your ClusterSecretStore reads from.
+# That value is what secret_remote_key in the ConfigMap points at.
 #
 # Dry run by default. Nothing is created until you pass --apply.
 #
-#   ./setup-aws.sh                 # show the plan
-#   ./setup-aws.sh --apply         # create it
+#   ./setup-aws.sh                              # show the plan
+#   ./setup-aws.sh --apply                      # create buckets, keys, IAM user
+#   ./setup-aws.sh --apply --create-credential  # ...and the Secrets Manager entry
 #
 set -euo pipefail
 
 # ---------------------------------------------------------------- settings --
 REGION="${REGION:-us-east-1}"
-PREFIX="${PREFIX:-acm-etcd-backup}"          # bucket name prefix; must be globally unique
-HUB_KUBECONTEXT="${HUB_KUBECONTEXT:-}"        # optional: oc context for the hub
+PREFIX="${PREFIX:-acm-etcd-backup}"          # bucket name prefix; globally unique
 
-HUB_BUCKET="${HUB_BUCKET:-${PREFIX}-hub}"
 SNAPSHOT_BUCKET="${SNAPSHOT_BUCKET:-${PREFIX}-snapshots}"
 KEYS_BUCKET="${KEYS_BUCKET:-${PREFIX}-keys}"
-
-HUB_ROLE_NAME="${HUB_ROLE_NAME:-${PREFIX}-hub-oadp}"
 UPLOADER_USER_NAME="${UPLOADER_USER_NAME:-${PREFIX}-uploader}"
+SECRET_NAME="${SECRET_NAME:-${PREFIX}/s3-uploader}"
 
 APPLY=0
-MAKE_IAM_USER=1
+CREATE_CRED=0
 for arg in "$@"; do
   case "$arg" in
-    --apply)       APPLY=1 ;;
-    --no-iam-user) MAKE_IAM_USER=0 ;;
+    --apply)             APPLY=1 ;;
+    --create-credential) CREATE_CRED=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -44,36 +42,19 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
 run() {
-  if [ "${APPLY}" -eq 1 ]; then
-    echo "+ $*" >&2
-    "$@"
-  else
-    echo "  would run: $*"
-  fi
+  if [ "${APPLY}" -eq 1 ]; then echo "+ $*" >&2; "$@"
+  else echo "  would run: $*"; fi
 }
-
 need() { command -v "$1" >/dev/null || { echo "missing required tool: $1" >&2; exit 1; }; }
 need aws
 need jq
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 
-# --------------------------------------------------- hub OIDC provider ------
-# Velero on the hub authenticates with AssumeRoleWithWebIdentity against the
-# hub cluster's own OIDC issuer. Read it from the hub rather than asking for it.
-if [ -n "${OIDC_PROVIDER:-}" ]; then
-  :
-else
-  need oc
-  OC=(oc)
-  [ -n "${HUB_KUBECONTEXT}" ] && OC=(oc --context "${HUB_KUBECONTEXT}")
-  ISSUER="$("${OC[@]}" get authentication cluster -o jsonpath='{.spec.serviceAccountIssuer}')"
-  if [ -z "${ISSUER}" ]; then
-    echo "Could not read .spec.serviceAccountIssuer from the hub." >&2
-    echo "Point oc at the ROSA HCP hub, or set OIDC_PROVIDER=oidc.op1.openshiftapps.com/xxxx" >&2
-    exit 1
-  fi
-  OIDC_PROVIDER="${ISSUER#https://}"
+if [ "${SNAPSHOT_BUCKET}" = "${KEYS_BUCKET}" ]; then
+  echo "FATAL: snapshot and keys buckets must differ - both use the same" >&2
+  echo "       <cluster>/<timestamp>/ layout and would overwrite each other." >&2
+  exit 1
 fi
 
 cat <<EOF
@@ -81,14 +62,13 @@ cat <<EOF
 Plan
   account              ${ACCOUNT_ID}
   region               ${REGION}
-  hub OIDC provider    ${OIDC_PROVIDER}
 
-  hub backup bucket    ${HUB_BUCKET}          (ACM hub state via OADP/Velero)
-  snapshot bucket      ${SNAPSHOT_BUCKET}     (etcd snapshot_*.db)
-  key material bucket  ${KEYS_BUCKET}         (static_kuberesources + encryption keys)
+  snapshot bucket      ${SNAPSHOT_BUCKET}   (snapshot_*.db)
+  key material bucket  ${KEYS_BUCKET}       (static_kuberesources + encryption keys)
+  layout               s3://<bucket>/<cluster-name>/<timestamp>/
 
-  hub IRSA role        ${HUB_ROLE_NAME}
-  uploader IAM user    $([ "${MAKE_IAM_USER}" -eq 1 ] && echo "${UPLOADER_USER_NAME}" || echo "(skipped)")
+  uploader IAM user    ${UPLOADER_USER_NAME}
+  secrets manager key  $([ "${CREATE_CRED}" -eq 1 ] && echo "${SECRET_NAME}" || echo "(skipped; pass --create-credential)")
 
 EOF
 [ "${APPLY}" -eq 1 ] || echo "DRY RUN - re-run with --apply to create these."
@@ -97,8 +77,7 @@ EOF
 make_bucket() {
   local bucket="$1"
   if aws s3api head-bucket --bucket "${bucket}" 2>/dev/null; then
-    echo "  bucket ${bucket} already exists, leaving it alone"
-    return
+    echo "  bucket ${bucket} already exists, leaving it alone"; return
   fi
   if [ "${REGION}" = "us-east-1" ]; then
     run aws s3api create-bucket --bucket "${bucket}" --region "${REGION}"
@@ -117,13 +96,9 @@ make_key() {
   # echoes the key ARN
   local alias="alias/$1" desc="$2" arn
   arn="$(aws kms describe-key --key-id "${alias}" --query KeyMetadata.Arn --output text 2>/dev/null || true)"
-  if [ -n "${arn}" ] && [ "${arn}" != "None" ]; then
-    echo "${arn}"
-    return
-  fi
+  if [ -n "${arn}" ] && [ "${arn}" != "None" ]; then echo "${arn}"; return; fi
   if [ "${APPLY}" -eq 0 ]; then
-    echo "arn:aws:kms:${REGION}:${ACCOUNT_ID}:key/WOULD-BE-CREATED"
-    return
+    echo "arn:aws:kms:${REGION}:${ACCOUNT_ID}:key/WOULD-BE-CREATED"; return
   fi
   arn="$(aws kms create-key --description "${desc}" --region "${REGION}" \
            --query KeyMetadata.Arn --output text)"
@@ -136,9 +111,8 @@ make_key() {
 }
 
 encrypt_bucket() {
-  local bucket="$1" key_arn="$2"
-  run aws s3api put-bucket-encryption --bucket "${bucket}" \
-    --server-side-encryption-configuration "$(jq -nc --arg k "${key_arn}" '{
+  run aws s3api put-bucket-encryption --bucket "$1" \
+    --server-side-encryption-configuration "$(jq -nc --arg k "$2" '{
       Rules: [{
         ApplyServerSideEncryptionByDefault: { SSEAlgorithm: "aws:kms", KMSMasterKeyID: $k },
         BucketKeyEnabled: true
@@ -148,103 +122,100 @@ encrypt_bucket() {
 
 echo
 echo "== buckets =="
-for b in "${HUB_BUCKET}" "${SNAPSHOT_BUCKET}" "${KEYS_BUCKET}"; do
-  make_bucket "${b}"
-done
+make_bucket "${SNAPSHOT_BUCKET}"
+make_bucket "${KEYS_BUCKET}"
 
 echo
 echo "== KMS keys =="
-HUB_KMS_ARN="$(make_key "${PREFIX}-hub"       "ACM hub backup (OADP/Velero)")"
 SNAP_KMS_ARN="$(make_key "${PREFIX}-snapshots" "etcd snapshots")"
 KEYS_KMS_ARN="$(make_key "${PREFIX}-keys"      "etcd encryption key material")"
-echo "  hub       ${HUB_KMS_ARN}"
 echo "  snapshots ${SNAP_KMS_ARN}"
 echo "  keys      ${KEYS_KMS_ARN}"
-
-encrypt_bucket "${HUB_BUCKET}"      "${HUB_KMS_ARN}"
 encrypt_bucket "${SNAPSHOT_BUCKET}" "${SNAP_KMS_ARN}"
 encrypt_bucket "${KEYS_BUCKET}"     "${KEYS_KMS_ARN}"
 
 echo
-echo "== lifecycle (retention) =="
+echo "== lifecycle (retention in S3; on-node retention is local_keep) =="
 for b in "${SNAPSHOT_BUCKET}" "${KEYS_BUCKET}"; do
   run aws s3api put-bucket-lifecycle-configuration --bucket "${b}" \
     --lifecycle-configuration "file://${HERE}/s3-lifecycle.json"
 done
-echo "  hub bucket retention is driven by BackupSchedule.spec.veleroTtl, not lifecycle"
 
-# ----------------------------------------------------------- hub IRSA role --
+# --------------------------------------------------- uploader IAM identity --
 echo
-echo "== hub IRSA role =="
-sed -e "s|ACCOUNT_ID|${ACCOUNT_ID}|g" \
-    -e "s|OIDC_PROVIDER|${OIDC_PROVIDER}|g" \
-    "${HERE}/iam-trust-policy-oadp-hub.json" > "${WORK}/hub-trust.json"
+echo "== uploader IAM user =="
+sed -e "s|SNAPSHOT_BUCKET|${SNAPSHOT_BUCKET}|g" \
+    -e "s|KEYS_BUCKET|${KEYS_BUCKET}|g" \
+    -e "s|SNAPSHOT_KMS_KEY_ARN|${SNAP_KMS_ARN}|g" \
+    -e "s|KEYS_KMS_KEY_ARN|${KEYS_KMS_ARN}|g" \
+    "${HERE}/iam-policy-etcd-backup.json" > "${WORK}/uploader-perms.json"
 
-sed -e "s|HUB_BACKUP_BUCKET|${HUB_BUCKET}|g" \
-    -e "s|HUB_KMS_KEY_ARN|${HUB_KMS_ARN}|g" \
-    "${HERE}/iam-policy-oadp-hub.json" > "${WORK}/hub-perms.json"
-
-if aws iam get-role --role-name "${HUB_ROLE_NAME}" >/dev/null 2>&1; then
-  echo "  role ${HUB_ROLE_NAME} exists; updating trust policy"
-  run aws iam update-assume-role-policy --role-name "${HUB_ROLE_NAME}" \
-    --policy-document "file://${WORK}/hub-trust.json"
+if aws iam get-user --user-name "${UPLOADER_USER_NAME}" >/dev/null 2>&1; then
+  echo "  user ${UPLOADER_USER_NAME} already exists"
 else
-  run aws iam create-role --role-name "${HUB_ROLE_NAME}" \
-    --assume-role-policy-document "file://${WORK}/hub-trust.json"
+  run aws iam create-user --user-name "${UPLOADER_USER_NAME}"
 fi
-run aws iam put-role-policy --role-name "${HUB_ROLE_NAME}" \
-  --policy-name "${PREFIX}-hub-oadp" \
-  --policy-document "file://${WORK}/hub-perms.json"
+run aws iam put-user-policy --user-name "${UPLOADER_USER_NAME}" \
+  --policy-name "${PREFIX}-uploader" \
+  --policy-document "file://${WORK}/uploader-perms.json"
 
-HUB_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${HUB_ROLE_NAME}"
-
-# --------------------------------------------------- managed cluster creds --
-if [ "${MAKE_IAM_USER}" -eq 1 ]; then
+# ------------------------------------- credential -> AWS Secrets Manager ----
+if [ "${CREATE_CRED}" -eq 1 ]; then
   echo
-  echo "== managed cluster uploader =="
-  sed -e "s|SNAPSHOT_BUCKET|${SNAPSHOT_BUCKET}|g" \
-      -e "s|KEYS_BUCKET|${KEYS_BUCKET}|g" \
-      -e "s|SNAPSHOT_KMS_KEY_ARN|${SNAP_KMS_ARN}|g" \
-      -e "s|KEYS_KMS_KEY_ARN|${KEYS_KMS_ARN}|g" \
-      "${HERE}/iam-policy-etcd-backup-managed.json" > "${WORK}/uploader-perms.json"
-
-  if ! aws iam get-user --user-name "${UPLOADER_USER_NAME}" >/dev/null 2>&1; then
-    run aws iam create-user --user-name "${UPLOADER_USER_NAME}"
+  echo "== access key -> Secrets Manager (${SECRET_NAME}) =="
+  if [ "${APPLY}" -eq 0 ]; then
+    echo "  would create an access key for ${UPLOADER_USER_NAME}"
+    echo "  would store it at ${SECRET_NAME} with properties"
+    echo "    aws_access_key_id / aws_secret_access_key"
   else
-    echo "  user ${UPLOADER_USER_NAME} already exists"
-  fi
-  run aws iam put-user-policy --user-name "${UPLOADER_USER_NAME}" \
-    --policy-name "${PREFIX}-uploader" \
-    --policy-document "file://${WORK}/uploader-perms.json"
+    # The plaintext key exists only inside this command substitution and the
+    # temp file below, both of which go away with the trap on exit.
+    KEYJSON="$(aws iam create-access-key --user-name "${UPLOADER_USER_NAME}" \
+                 --query 'AccessKey.{aws_access_key_id:AccessKeyId,aws_secret_access_key:SecretAccessKey}' \
+                 --output json)"
+    printf '%s' "${KEYJSON}" > "${WORK}/cred.json"
+    chmod 600 "${WORK}/cred.json"
 
+    if aws secretsmanager describe-secret --secret-id "${SECRET_NAME}" \
+         --region "${REGION}" >/dev/null 2>&1; then
+      aws secretsmanager put-secret-value --secret-id "${SECRET_NAME}" \
+        --secret-string "file://${WORK}/cred.json" --region "${REGION}" >/dev/null
+      echo "  rotated existing secret ${SECRET_NAME}"
+      echo "  NOTE: the previous access key is still active - delete it once"
+      echo "        every cluster has picked up the new value:"
+      echo "          aws iam list-access-keys --user-name ${UPLOADER_USER_NAME}"
+    else
+      aws secretsmanager create-secret --name "${SECRET_NAME}" \
+        --description "S3 uploader credential for the etcd backup CronJob" \
+        --secret-string "file://${WORK}/cred.json" \
+        --kms-key-id "${KEYS_KMS_ARN}" --region "${REGION}" >/dev/null
+      echo "  created ${SECRET_NAME}"
+    fi
+  fi
   echo
-  echo "  Access keys are NOT created here on purpose - run this yourself so the"
-  echo "  secret only ever exists in your shell, and rotate it on a schedule:"
-  echo
-  echo "    aws iam create-access-key --user-name ${UPLOADER_USER_NAME}"
+  echo "  Your ClusterSecretStore needs secretsmanager:GetSecretValue on this"
+  echo "  secret, and kms:Decrypt on ${KEYS_KMS_ARN}."
 fi
 
 # ---------------------------------------------------------------- summary ---
 cat <<EOF
 
 ================================================================================
-Next: wire these values into the manifests
+Next: paste these into hub-config/02-etcd-backup-config.yaml
 ================================================================================
 
-hub-config/02-etcd-backup-config.yaml
   s3_bucket:        ${SNAPSHOT_BUCKET}
   s3_keys_bucket:   ${KEYS_BUCKET}
   s3_region:        ${REGION}
   kms_key_id:       ${SNAP_KMS_ARN}
   kms_key_id_keys:  ${KEYS_KMS_ARN}
+  secret_remote_key: ${SECRET_NAME}
 
-policies/hub/policy-hub-backup-oadp.yaml
-  ROLEARN value:    ${HUB_ROLE_ARN}
+Still to set by hand (they describe your existing ESO setup, not anything
+created here):
 
-policies/hub/policy-hub-backup-dpa.yaml
-  objectStorage.bucket: ${HUB_BUCKET}
-  config.region:        ${REGION}
-  config.kmsKeyId:      ${HUB_KMS_ARN}
+  secret_store_name: <your ClusterSecretStore>
+  secret_store_kind: ClusterSecretStore
 
 EOF
 [ "${APPLY}" -eq 1 ] || echo "(DRY RUN - nothing above was actually created)"

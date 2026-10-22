@@ -23,8 +23,8 @@
         "s3:ListMultipartUploadParts"
       ],
       "Resource": [
-        "arn:aws:s3:::SNAPSHOT_BUCKET/etcd-snapshots/*",
-        "arn:aws:s3:::KEYS_BUCKET/etcd-keys/*"
+        "arn:aws:s3:::SNAPSHOT_BUCKET/*",
+        "arn:aws:s3:::KEYS_BUCKET/*"
       ]
     },
     {

@@ -54,35 +54,39 @@ spec:
           object-templates-raw: |
             {{- /* 12 hours, for a 6-hourly schedule: one missed run is tolerated. */ -}}
             {{- $maxAge := 43200 -}}
-            {{- $cj := (lookup "batch/v1" "CronJob" "ocp-etcd-backup" "etcd-backup") -}}
-            {{- $last := "" -}}
-            {{- if $cj -}}
-              {{- if $cj.status -}}
-                {{- $last = (default "" $cj.status.lastSuccessfulTime) -}}
+            {{- $stale := list -}}
+            {{- range $name := (list "etcd-backup" "etcd-backup-upload") -}}
+              {{- $cj := (lookup "batch/v1" "CronJob" "ocp-etcd-backup" $name) -}}
+              {{- $last := "" -}}
+              {{- if $cj -}}
+                {{- if $cj.status -}}
+                  {{- $last = (default "" $cj.status.lastSuccessfulTime) -}}
+                {{- end -}}
               {{- end -}}
-            {{- end -}}
-            {{- $stale := true -}}
-            {{- if ne $last "" -}}
-              {{- $age := sub (now | unixEpoch) (toDate "2006-01-02T15:04:05Z" $last | unixEpoch) -}}
-              {{- if lt $age $maxAge -}}
-                {{- $stale = false -}}
+              {{- if eq $last "" -}}
+                {{- $stale = append $stale $name -}}
+              {{- else -}}
+                {{- $age := sub (now | unixEpoch) (toDate "2006-01-02T15:04:05Z" $last | unixEpoch) -}}
+                {{- if ge $age $maxAge -}}
+                  {{- $stale = append $stale $name -}}
+                {{- end -}}
               {{- end -}}
             {{- end -}}
             {{- if $stale }}
+            {{- range $name := $stale }}
             - complianceType: musthave
               objectDefinition:
                 apiVersion: v1
                 kind: ConfigMap
                 metadata:
-                  name: etcd-backup-succeeded-within-12h
+                  name: {{ printf "%s-succeeded-within-12h" $name }}
                   namespace: ocp-etcd-backup
-                data:
-                  lastSuccessfulTime: {{ printf "%q" (default "never" $last) }}
+            {{- end }}
             {{- else }}
             []
             {{- end }}
 ---
-# Reuses the Placement from policies/managed/placement-managed.yaml, so apply
+# Reuses the Placement from policies/placement.yaml, so apply
 # that directory first. Bound separately rather than added to the PolicySet so
 # this can be removed on its own if the templating does not behave.
 apiVersion: policy.open-cluster-management.io/v1

@@ -2,12 +2,12 @@
 apiVersion: policy.open-cluster-management.io/v1beta1
 kind: PolicySet
 metadata:
-  name: managed-cluster-etcd-backup
+  name: etcd-backup
   namespace: etcd-backup-policies
 spec:
   description: >-
-    etcd snapshot + encryption key backup to S3 for standalone OpenShift
-    managed clusters.
+    Snapshots etcd on standalone OpenShift managed clusters, keeps the backup
+    on the node, and copies it to S3 from a separate CronJob five minutes later.
   policies:
     - policy-etcd-backup-prereqs
     - policy-etcd-backup-cronjob
@@ -15,9 +15,8 @@ spec:
 # Three filters, all of which must pass:
 #
 #  1. local-cluster != true
-#       The hub is ROSA HCP. It has no control plane nodes to snapshot, so
-#       this policy must never land on it. The hub is covered by the OADP
-#       chain in policies/hub/ instead.
+#       Never target the ACM hub. It runs on ROSA HCP and has no control plane
+#       nodes to snapshot.
 #
 #  2. product.open-cluster-management.io == OpenShift
 #       This ClusterClaim distinguishes self-managed OpenShift from the managed
@@ -66,7 +65,7 @@ spec:
 apiVersion: policy.open-cluster-management.io/v1
 kind: PlacementBinding
 metadata:
-  name: binding-managed-cluster-etcd-backup
+  name: binding-etcd-backup
   namespace: etcd-backup-policies
 placementRef:
   apiGroup: cluster.open-cluster-management.io
@@ -75,4 +74,4 @@ placementRef:
 subjects:
   - apiGroup: policy.open-cluster-management.io
     kind: PolicySet
-    name: managed-cluster-etcd-backup
+    name: etcd-backup

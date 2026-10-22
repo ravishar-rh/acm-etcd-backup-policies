@@ -1,47 +1,75 @@
 ---
 # Single source of truth for the backup configuration.
 #
-# The policies in policies/managed/ read these values at template-resolution
-# time on the hub, using {{hub fromConfigMap ... hub}}. Edit this ConfigMap and
-# the change propagates to every targeted managed cluster - you do not need to
-# edit the Policy manifests themselves.
+# The policies read these values at template-resolution time on the hub with
+# {{hub fromConfigMap ... hub}}. Edit this ConfigMap and the change propagates
+# to every targeted managed cluster - you do not edit the Policy manifests.
+#
+# This lives in the SAME namespace as the Policy objects on purpose: ACM
+# restricts hub template lookups to the policy's own namespace unless you grant
+# the policy propagator extra RBAC.
 #
 # Apply to the HUB cluster.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: etcd-backup-config
-  namespace: open-cluster-management-backup
+  namespace: etcd-backup-policies
 data:
-  # ---- Bucket holding the etcd snapshot (snapshot_<ts>.db) --------------------
+  # ---- Where backups land in S3 ----------------------------------------------
+  # Layout is  s3://<bucket>/<cluster-name>/<timestamp>/...
+  # so each managed cluster owns a top-level directory named after it.
   s3_bucket: "CHANGEME-etcd-snapshots"
-  s3_prefix: "etcd-snapshots"
 
-  # ---- SEPARATE bucket holding key material -----------------------------------
-  # static_kuberesources_<ts>.tar.gz contains the etcd *encryption keys* when
-  # etcd encryption is enabled, so Red Hat recommends storing it apart from the
-  # snapshot. Point this at a different bucket with a tighter bucket policy and
-  # its own KMS key. Using the same bucket with a different prefix still works
-  # but gives you a weaker separation of duties.
+  # SEPARATE bucket for key material. static_kuberesources_<ts>.tar.gz contains
+  # the etcd encryption keys, so Red Hat's guidance is to keep it away from the
+  # snapshot - whoever holds both holds the decrypted cluster. Must be a
+  # different bucket from s3_bucket, since both use the same <cluster>/<ts>/ path.
   s3_keys_bucket: "CHANGEME-etcd-keys"
-  s3_keys_prefix: "etcd-keys"
 
   s3_region: "us-east-1"
 
-  # ---- Encryption at rest -----------------------------------------------------
-  # KMS key ARN/ID for SSE-KMS. Leave empty to fall back to SSE-S3 (AES256).
+  # SSE-KMS key ARNs. Leave empty to fall back to SSE-S3 (AES256).
   kms_key_id: ""
   kms_key_id_keys: ""
 
-  # ---- Schedule ---------------------------------------------------------------
-  # Default: every 6 hours, at a minute offset so that all clusters do not fire
-  # at once. Retention is handled by the S3 lifecycle rule (aws/s3-lifecycle.json),
-  # not by the job.
-  schedule: "17 */6 * * *"
+  # ---- Schedules --------------------------------------------------------------
+  # Two separate CronJobs. The snapshot runs, leaves its output on the control
+  # plane node, and the upload job picks it up on its next pass.
+  #
+  # Keep upload_schedule 5 minutes behind schedule. Nothing enforces the gap -
+  # it is just two cron expressions - but nothing breaks if a snapshot overruns
+  # either: the upload job only touches directories marked .complete, so a slow
+  # backup is simply collected on the following pass.
+  schedule: "0 */6 * * *"
+  upload_schedule: "5 */6 * * *"
+
+  # ---- On-node retention ------------------------------------------------------
+  # Backups stay on the node after upload. This caps how many, because an
+  # unbounded pile of multi-GB snapshots on a control plane node fills the same
+  # filesystem etcd itself runs on. Pruning happens after a successful snapshot,
+  # oldest first, and warns loudly if it has to drop one that never reached S3.
+  local_keep: "2"
+
+  # Number of control plane nodes. The upload job runs one pod per node (the
+  # snapshot can land on any master, so the uploader has to cover all of them).
+  control_plane_count: "3"
+
+  # ---- Existing external secret for S3 access ---------------------------------
+  # The policy creates an ExternalSecret in the backup namespace that pulls from
+  # the ClusterSecretStore you already run. No credential is stored in git or on
+  # the hub.
+  secret_store_name: "CHANGEME-cluster-secret-store"
+  secret_store_kind: "ClusterSecretStore"
+
+  # Key in AWS Secrets Manager holding the uploader credential, and the two
+  # JSON properties inside it.
+  secret_remote_key: "CHANGEME/etcd-backup/s3-uploader"
+  secret_key_id_property: "aws_access_key_id"
+  secret_access_key_property: "aws_secret_access_key"
 
   # ---- Images -----------------------------------------------------------------
-  # ose_cli_image needs `oc` and is used for the privileged snapshot step.
-  # aws_cli_image needs the AWS CLI v2 and is used for the upload step.
-  # Mirror both into your own registry for disconnected clusters.
+  # ose_cli_image needs `oc`; aws_cli_image needs the AWS CLI v2.
+  # Mirror both and pin the tags for disconnected clusters.
   ose_cli_image: "registry.redhat.io/openshift4/ose-cli:latest"
   aws_cli_image: "public.ecr.aws/aws-cli/aws-cli:latest"

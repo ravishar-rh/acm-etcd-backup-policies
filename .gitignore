@@ -1,5 +1,5 @@
-# Never commit the real credential - only the .example.yaml belongs in git.
-hub-config/03-etcd-backup-s3-secret.yaml
+# Credentials come from the External Secrets Operator, so none should ever
+# exist as a file here. These patterns are a backstop, not a workflow.
 *-secret.yaml
-!*.example.yaml
+*-credentials.json
 .env

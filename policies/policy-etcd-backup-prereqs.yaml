@@ -1,7 +1,7 @@
 ---
-# Namespace, service account, RBAC and S3 credential for the etcd backup job.
-# Split from the CronJob policy so the CronJob can declare a dependency and
-# never land on a cluster that is missing its credential.
+# Namespace, service account, RBAC and the S3 credential for the etcd backup
+# jobs. Split from the CronJob policy so the CronJobs can declare a dependency
+# and never land on a cluster whose credential has not synced yet.
 apiVersion: policy.open-cluster-management.io/v1
 kind: Policy
 metadata:
@@ -14,8 +14,9 @@ metadata:
     policy.open-cluster-management.io/description: >-
       Prerequisites for the managed cluster etcd backup: the ocp-etcd-backup
       namespace, a service account allowed to run privileged on control plane
-      nodes, read access to the etcd encryption key secrets, and the S3
-      credential sourced from the hub.
+      nodes, read access to the etcd encryption key secrets, and an
+      ExternalSecret that syncs the S3 uploader credential from the existing
+      ClusterSecretStore.
 spec:
   remediationAction: enforce
   disabled: false
@@ -53,7 +54,7 @@ spec:
                   name: etcd-backup
                   namespace: ocp-etcd-backup
 
-            # Allows the pod to run with the `privileged` SCC. Scoped to the
+            # Allows the pods to run with the `privileged` SCC. Scoped to the
             # backup namespace rather than granted cluster-wide.
             - complianceType: musthave
               objectDefinition:
@@ -71,8 +72,9 @@ spec:
                     name: etcd-backup
                     namespace: ocp-etcd-backup
 
-            # Read the APIServer config so the backup records whether (and with
-            # which provider) etcd encryption was enabled at snapshot time.
+            # Read the APIServer config (did this cluster have etcd encryption
+            # on, and with which provider) and the ClusterVersion (which
+            # z-stream this backup can be restored onto).
             - complianceType: musthave
               objectDefinition:
                 apiVersion: rbac.authorization.k8s.io/v1
@@ -81,7 +83,7 @@ spec:
                   name: etcd-backup-reader
                 rules:
                   - apiGroups: ["config.openshift.io"]
-                    resources: ["apiservers"]
+                    resources: ["apiservers", "clusterversions"]
                     verbs: ["get", "list"]
                   - apiGroups: ["operator.openshift.io"]
                     resources: ["etcds", "kubeapiservers", "openshiftapiservers"]
@@ -103,8 +105,8 @@ spec:
                     namespace: ocp-etcd-backup
 
             # THE ETCD ENCRYPTION KEYS.
-            # When etcd encryption is on, the AES/AES-GCM keys live as secrets
-            # named encryption-key-<component>-<N> in openshift-config-managed.
+            # When etcd encryption is on, the AES keys live as secrets named
+            # encryption-key-<component>-<N> in openshift-config-managed.
             # Namespace-scoped read access, nothing wider.
             - complianceType: musthave
               objectDefinition:
@@ -134,18 +136,54 @@ spec:
                     name: etcd-backup
                     namespace: ocp-etcd-backup
 
-            # S3 credential, resolved on the HUB from the single secret in
-            # open-cluster-management-backup. `fromSecret` returns the already
-            # base64-encoded value, so it belongs under `data`, not `stringData`.
-            # ACM encrypts these values per-cluster before replication.
+            # S3 credential, synced by the External Secrets Operator from the
+            # ClusterSecretStore you already run (AWS Secrets Manager behind it).
+            #
+            # A pod can only read Secrets in its own namespace, which is why
+            # this pulls into ocp-etcd-backup rather than referencing an
+            # ExternalSecret that lives somewhere else.
+            #
+            # apiVersion note: external-secrets.io/v1beta1 was removed in ESO
+            # v0.17.0 and the compatibility flag expired in May 2026, so v1 is
+            # correct for any current install. The schemas are identical, so on
+            # an older ESO this is a one-word change.
             - complianceType: musthave
               objectDefinition:
-                apiVersion: v1
-                kind: Secret
+                apiVersion: external-secrets.io/v1
+                kind: ExternalSecret
                 metadata:
                   name: etcd-backup-s3
                   namespace: ocp-etcd-backup
-                type: Opaque
-                data:
-                  aws_access_key_id: '{{hub fromSecret "open-cluster-management-backup" "etcd-backup-s3" "aws_access_key_id" hub}}'
-                  aws_secret_access_key: '{{hub fromSecret "open-cluster-management-backup" "etcd-backup-s3" "aws_secret_access_key" hub}}'
+                spec:
+                  refreshInterval: 1h
+                  secretStoreRef:
+                    name: '{{hub fromConfigMap "etcd-backup-policies" "etcd-backup-config" "secret_store_name" hub}}'
+                    kind: '{{hub fromConfigMap "etcd-backup-policies" "etcd-backup-config" "secret_store_kind" hub}}'
+                  target:
+                    name: etcd-backup-s3
+                    creationPolicy: Owner
+                    deletionPolicy: Delete
+                  data:
+                    - secretKey: aws_access_key_id
+                      remoteRef:
+                        key: '{{hub fromConfigMap "etcd-backup-policies" "etcd-backup-config" "secret_remote_key" hub}}'
+                        property: '{{hub fromConfigMap "etcd-backup-policies" "etcd-backup-config" "secret_key_id_property" hub}}'
+                    - secretKey: aws_secret_access_key
+                      remoteRef:
+                        key: '{{hub fromConfigMap "etcd-backup-policies" "etcd-backup-config" "secret_remote_key" hub}}'
+                        property: '{{hub fromConfigMap "etcd-backup-policies" "etcd-backup-config" "secret_access_key_property" hub}}'
+
+            # Gate the CronJob policy on the credential actually having synced.
+            # Without this an upload job can start before ESO has written the
+            # Secret and fail on a missing secretKeyRef.
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: external-secrets.io/v1
+                kind: ExternalSecret
+                metadata:
+                  name: etcd-backup-s3
+                  namespace: ocp-etcd-backup
+                status:
+                  conditions:
+                    - type: Ready
+                      status: "True"
