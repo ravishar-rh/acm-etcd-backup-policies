@@ -27,7 +27,10 @@ data:
   # different bucket from s3_bucket, since both use the same <cluster>/<ts>/ path.
   s3_keys_bucket: "CHANGEME-etcd-keys"
 
-  s3_region: "us-east-1"
+  # Region of the two buckets above - used by the upload job as
+  # AWS_DEFAULT_REGION. This is independent of where the Secrets Manager entry
+  # lives: that region is set on the ClusterSecretStore, not here.
+  s3_region: "eu-west-1"
 
   # SSE-KMS keys. Leave empty to fall back to SSE-S3 (AES256).
   #

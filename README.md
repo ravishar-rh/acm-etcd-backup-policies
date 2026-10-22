@@ -239,8 +239,8 @@ Nothing here weakens these, but they are the real secrets in the system:
 
 ```bash
 cd aws
-REGION=us-east-1 PREFIX=acm-etcd-backup ./setup-aws.sh                     # dry run
-REGION=us-east-1 PREFIX=acm-etcd-backup ./setup-aws.sh --apply --create-credential
+REGION=eu-west-1 PREFIX=acm-etcd-backup ./setup-aws.sh                     # dry run
+REGION=eu-west-1 SECRETS_REGION=us-east-2 PREFIX=acm-etcd-backup ./setup-aws.sh --apply --create-credential
 ```
 
 Creates two versioned, encrypted, private buckets; two KMS keys with rotation;

@@ -19,7 +19,13 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------- settings --
-REGION="${REGION:-us-east-1}"
+REGION="${REGION:-eu-west-1}"
+
+# Where the Secrets Manager entry lives. This is NOT always the bucket region:
+# it must match the region configured on the ClusterSecretStore that ESO reads
+# through, or ESO will look in the wrong region and never find the credential.
+#   e.g.  REGION=eu-west-1 SECRETS_REGION=us-east-2 ./setup-aws.sh --apply ...
+SECRETS_REGION="${SECRETS_REGION:-${REGION}}"
 PREFIX="${PREFIX:-acm-etcd-backup}"          # bucket name prefix; globally unique
 
 SNAPSHOT_BUCKET="${SNAPSHOT_BUCKET:-${PREFIX}-snapshots}"
@@ -61,7 +67,8 @@ cat <<EOF
 
 Plan
   account              ${ACCOUNT_ID}
-  region               ${REGION}
+  bucket/KMS region    ${REGION}
+  secrets mgr region   ${SECRETS_REGION}   (must match your ClusterSecretStore)
 
   snapshot bucket      ${SNAPSHOT_BUCKET}   (snapshot_*.db)
   key material bucket  ${KEYS_BUCKET}       (static_kuberesources + encryption keys)
@@ -177,19 +184,29 @@ if [ "${CREATE_CRED}" -eq 1 ]; then
     chmod 600 "${WORK}/cred.json"
 
     if aws secretsmanager describe-secret --secret-id "${SECRET_NAME}" \
-         --region "${REGION}" >/dev/null 2>&1; then
+         --region "${SECRETS_REGION}" >/dev/null 2>&1; then
       aws secretsmanager put-secret-value --secret-id "${SECRET_NAME}" \
-        --secret-string "file://${WORK}/cred.json" --region "${REGION}" >/dev/null
+        --secret-string "file://${WORK}/cred.json" --region "${SECRETS_REGION}" >/dev/null
       echo "  rotated existing secret ${SECRET_NAME}"
       echo "  NOTE: the previous access key is still active - delete it once"
       echo "        every cluster has picked up the new value:"
       echo "          aws iam list-access-keys --user-name ${UPLOADER_USER_NAME}"
     else
+      # Secrets Manager cannot encrypt with a KMS key from another region, so
+      # the customer-managed key is only usable when the secret and the keys
+      # bucket share a region. Otherwise fall back to the AWS-managed key.
+      SM_KMS=()
+      if [ "${SECRETS_REGION}" = "${REGION}" ]; then
+        SM_KMS=(--kms-key-id "${KEYS_KMS_ARN}")
+      else
+        echo "  note: ${SECRETS_REGION} != ${REGION}, so the secret uses the"
+        echo "        AWS-managed Secrets Manager key rather than ${KEYS_KMS_ARN}"
+      fi
       aws secretsmanager create-secret --name "${SECRET_NAME}" \
         --description "S3 uploader credential for the etcd backup CronJob" \
         --secret-string "file://${WORK}/cred.json" \
-        --kms-key-id "${KEYS_KMS_ARN}" --region "${REGION}" >/dev/null
-      echo "  created ${SECRET_NAME}"
+        "${SM_KMS[@]}" --region "${SECRETS_REGION}" >/dev/null
+      echo "  created ${SECRET_NAME} in ${SECRETS_REGION}"
     fi
   fi
   echo
@@ -208,6 +225,10 @@ Next: paste these into config/02-backup-settings.yaml
   s3_keys_bucket:   ${KEYS_BUCKET}
   s3_region:        ${REGION}
   secret_remote_key: ${SECRET_NAME}
+
+  (Secrets Manager entry is in ${SECRETS_REGION}; the ClusterSecretStore's own
+   region setting governs where ESO reads it - s3_region below is only used by
+   the upload job to reach the buckets.)
 
   # Aliases, not ARNs - a KMS ARN would put your AWS account ID into the
   # GitOps repo for no benefit. The ARNs are shown below for reference only;
