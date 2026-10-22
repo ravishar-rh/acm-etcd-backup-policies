@@ -156,6 +156,76 @@ policy's own namespace.
 
 ---
 
+## GitOps safety
+
+This repo is designed to be committed to a GitOps repo in full. **No file here
+holds, or needs to hold, a credential** — and CI enforces that rather than
+relying on review.
+
+What is actually in these manifests, exhaustively:
+
+| In git | Not in git |
+|---|---|
+| Bucket names, region, schedules | AWS access key ID / secret |
+| KMS **aliases** (not ARNs) | AWS account ID |
+| The *name* of your ClusterSecretStore | Anything that store contains |
+| The Secrets Manager *path* (`secret_remote_key`) | The value at that path |
+| The *key names* `aws_access_key_id` / `aws_secret_access_key` | Their values |
+
+The credential never transits git or the hub. At runtime the prereqs policy
+creates an `ExternalSecret` on each managed cluster, ESO reads AWS Secrets
+Manager, and the Secret materialises only in `ocp-etcd-backup` on that cluster.
+Rotation happens in Secrets Manager; nothing in git changes.
+
+Two deliberate choices support this:
+
+- **KMS aliases, not ARNs.** A KMS ARN embeds your 12-digit AWS account ID. An
+  alias gets identical encryption without publishing the account number, so
+  `setup-aws.sh` prints aliases for the ConfigMap and shows ARNs for reference
+  only. (Cross-account KMS is the one case needing a full ARN.)
+- **No `fromSecret` hub templates.** An earlier revision pulled the credential
+  from a Secret on the hub. ACM encrypts those values per-cluster, so it was
+  safe, but it still meant a credential had to be hand-applied to the hub
+  outside GitOps. ESO removes that step entirely.
+
+### The one trap: do not render this repo with Helm
+
+The policies contain ACM hub templates like
+`{{hub fromConfigMap ... hub}}`. These must reach the hub **verbatim** — ACM
+resolves them, nothing else should. Helm would try to evaluate `{{ ... }}` at
+render time and fail or mangle them.
+
+Point Argo CD at this repo as a **plain directory or Kustomize** source. If you
+need it inside a Helm chart, the `{{hub` openers have to be escaped, which is
+worth avoiding.
+
+### CI
+
+`.github/workflows/verify.yaml` runs on every PR and blocks:
+
+- any `Secret` carrying literal data — **including Secrets nested inside ACM
+  Policy `object-templates`**, which a flat `grep -r "kind: Secret"` reads past
+- AWS access keys, secret keys, private keys, account IDs in ARNs
+- YAML that does not parse, and syntax errors in the shell embedded in CronJobs
+
+Run it locally before committing:
+
+```bash
+pip install pyyaml
+python3 scripts/verify.py .
+```
+
+### Still yours to protect
+
+Nothing here weakens these, but they are the real secrets in the system:
+
+- the ClusterSecretStore's own credentials / IRSA role
+- the Secrets Manager entry holding the uploader key
+- read access to the **keys bucket** — snapshot plus keys is a plaintext copy
+  of the cluster
+
+---
+
 ## Install
 
 ### 1. AWS

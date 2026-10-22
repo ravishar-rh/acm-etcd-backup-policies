@@ -29,9 +29,15 @@ data:
 
   s3_region: "us-east-1"
 
-  # SSE-KMS key ARNs. Leave empty to fall back to SSE-S3 (AES256).
-  kms_key_id: ""
-  kms_key_id_keys: ""
+  # SSE-KMS keys. Leave empty to fall back to SSE-S3 (AES256).
+  #
+  # Use the ALIAS, not the ARN. A KMS ARN embeds your 12-digit AWS account ID,
+  # and this file lives in a GitOps repo - there is no reason to publish the
+  # account number to get the same encryption. Aliases resolve within the
+  # account the cluster is authenticating into.
+  # (Cross-account KMS is the one case that needs a full ARN.)
+  kms_key_id: "alias/acm-etcd-backup-snapshots"
+  kms_key_id_keys: "alias/acm-etcd-backup-keys"
 
   # ---- Schedules --------------------------------------------------------------
   # Two separate CronJobs. The snapshot runs, leaves its output on the control

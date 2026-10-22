@@ -207,9 +207,16 @@ Next: paste these into hub-config/02-etcd-backup-config.yaml
   s3_bucket:        ${SNAPSHOT_BUCKET}
   s3_keys_bucket:   ${KEYS_BUCKET}
   s3_region:        ${REGION}
-  kms_key_id:       ${SNAP_KMS_ARN}
-  kms_key_id_keys:  ${KEYS_KMS_ARN}
   secret_remote_key: ${SECRET_NAME}
+
+  # Aliases, not ARNs - a KMS ARN would put your AWS account ID into the
+  # GitOps repo for no benefit. The ARNs are shown below for reference only;
+  # do not paste them into the ConfigMap.
+  kms_key_id:       alias/${PREFIX}-snapshots
+  kms_key_id_keys:  alias/${PREFIX}-keys
+
+    (snapshots key ARN: ${SNAP_KMS_ARN})
+    (keys key ARN:      ${KEYS_KMS_ARN})
 
 Still to set by hand (they describe your existing ESO setup, not anything
 created here):

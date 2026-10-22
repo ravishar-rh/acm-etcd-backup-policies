@@ -1,0 +1,42 @@
+name: verify
+
+# This repo is consumed by GitOps, so a bad merge reaches clusters without a
+# human in the loop. Block the two failure modes that matter: a credential
+# committed by accident, and a manifest that does not parse.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet pyyaml
+
+      - name: No credentials, valid manifests, valid embedded shell
+        run: python3 scripts/verify.py .
+
+      - name: Shell scripts parse
+        run: |
+          for f in $(git ls-files '*.sh'); do
+            bash -n "$f" || exit 1
+          done
+          echo "shell OK"
+
+      - name: IAM policy documents are valid JSON
+        run: |
+          for f in $(git ls-files 'aws/*.json'); do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" || exit 1
+          done
+          echo "json OK"
