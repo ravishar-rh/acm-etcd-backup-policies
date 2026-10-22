@@ -201,7 +201,7 @@ fi
 cat <<EOF
 
 ================================================================================
-Next: paste these into hub-config/02-etcd-backup-config.yaml
+Next: paste these into config/02-backup-settings.yaml
 ================================================================================
 
   s3_bucket:        ${SNAPSHOT_BUCKET}

@@ -140,12 +140,19 @@ first, then raise `local_keep`.
 
 ## Layout
 
+**Everything in this repo is applied to the hub.** The hub is the control
+point that distributes these policies — it is not a backup target, and nothing
+here backs it up. The split below is "what you edit" versus "what you apply
+as-is", not hub versus managed cluster.
+
 ```
-hub-config/            apply to the hub directly (namespace, config)
-policies/              the two policies + Placement
-policies/optional/     backup-staleness detection; validate before trusting
-aws/                   buckets, KMS keys, IAM policy, setup script
-docs/RESTORE.md        restore procedure
+config/01-namespace.yaml        policy namespace + ManagedClusterSetBinding
+config/02-backup-settings.yaml  THE ONE FILE YOU EDIT - buckets, schedules, ESO refs
+policies/                       the two policies + Placement
+policies/optional/              backup-staleness detection; validate before trusting
+aws/                            buckets, KMS keys, IAM policy, setup script
+scripts/verify.py               CI guard: no credentials, manifests parse
+docs/RESTORE.md                 restore procedure
 ```
 
 Configuration lives in **one** place: the `etcd-backup-config` ConfigMap on the
@@ -248,17 +255,17 @@ Your ClusterSecretStore needs `secretsmanager:GetSecretValue` on that secret and
 ### 2. Fill in the placeholders
 
 ```bash
-grep -rn CHANGEME hub-config/
+grep -rn CHANGEME config/
 ```
 
-Everything is in `hub-config/02-etcd-backup-config.yaml`: buckets, region, KMS
+Everything is in `config/02-backup-settings.yaml`: buckets, region, KMS
 ARNs, schedules, and the three fields describing your existing external secret
 (`secret_store_name`, `secret_store_kind`, `secret_remote_key`).
 
 ### 3. Apply to the hub
 
 ```bash
-oc apply -f hub-config/
+oc apply -f config/
 oc apply -f policies/
 ```
 
